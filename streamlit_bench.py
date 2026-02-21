@@ -3,18 +3,15 @@ import os
 import time
 import base64
 import tracemalloc
+import gc
 
 import streamlit as st
 import psutil
 from PIL import Image
 
-# Si quieres usar tus funciones reales, descomenta:
-# import ia_engine
-# import html_generator
-
 
 # ----------------------------
-# Helpers de medición
+# Medición
 # ----------------------------
 def rss_mb() -> float:
     return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
@@ -24,33 +21,51 @@ def ms() -> float:
     return time.perf_counter() * 1000
 
 
-def stage_log(rows, name, t_start_ms, rss_base):
+def stage(rows, name, t0, rss0):
     rows.append(
         {
             "etapa": name,
-            "ms": round(ms() - t_start_ms, 1),
+            "ms": round(ms() - t0, 1),
             "rss_mb": round(rss_mb(), 1),
-            "delta_mb": round(rss_mb() - rss_base, 1),
+            "delta_mb": round(rss_mb() - rss0, 1),
         }
     )
 
 
 # ----------------------------
-# Pipeline "demo" (sin Vertex)
+# Funciones “tipo app”
 # ----------------------------
 def normalize_to_jpeg_bytes(file_bytes: bytes, max_side=800, quality=60) -> bytes:
-    """Normaliza a JPEG (similar a tu idea)."""
+    # PIL abre imagen HD (pico de RAM aquí)
     img = Image.open(io.BytesIO(file_bytes))
     img = img.convert("RGB")
     img.thumbnail((max_side, max_side))
-
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
 
 
-def html_embed_base64(jpeg_list: list[bytes]) -> str:
-    """Genera un HTML sencillo con imágenes embebidas (sin PIL extra)."""
+def html_from_pil_images(pil_images, max_side=800, quality=60) -> str:
+    """
+    Simula html_generator actual:
+    - recibe PIL Images
+    - copia/reescala/guarda jpeg
+    - base64
+    """
+    parts = []
+    for img in pil_images:
+        im = img.copy()
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.b64encode(out.getvalue()).decode("ascii")
+        parts.append(f"<img style='max-width:320px;margin:6px' src='data:image/jpeg;base64,{b64}' />")
+    return "<html><body>" + "\n".join(parts) + "</body></html>"
+
+
+def html_from_jpeg_bytes(jpeg_list) -> str:
+    """Optimizado: base64 directo, sin PIL."""
     parts = []
     for b in jpeg_list:
         b64 = base64.b64encode(b).decode("ascii")
@@ -58,31 +73,44 @@ def html_embed_base64(jpeg_list: list[bytes]) -> str:
     return "<html><body>" + "\n".join(parts) + "</body></html>"
 
 
+def open_jpegs_as_pil(jpeg_list):
+    """Simula tu _state_to_pil_images(): reabre bytes ya normalizados (otra pasada PIL)."""
+    out = []
+    for b in jpeg_list:
+        out.append(Image.open(io.BytesIO(b)))
+    return out
+
+
 # ----------------------------
 # UI
 # ----------------------------
-st.set_page_config(page_title="Bench RAM fotos", layout="wide")
-st.title("Bench de RAM (fotos)")
+st.set_page_config(page_title="Bench RAM v2 (doble PIL vs optimizado)", layout="wide")
+st.title("Bench RAM v2 — Simulación app vs optimizado")
 
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
-    st.subheader("Entrada")
     uploads = st.file_uploader(
-        "Sube 5 fotos (JPG/PNG/WEBP). Cuanto más grandes, mejor para el test.",
+        "Sube las mismas 5 fotos HD (JPG/PNG/WEBP).",
         type=["jpg", "jpeg", "png", "webp"],
         accept_multiple_files=True,
     )
 
-    max_photos = st.number_input("Máximo de fotos a procesar", min_value=1, max_value=20, value=5, step=1)
-    max_side = st.number_input("Max side (px) para normalizar", min_value=200, max_value=3000, value=800, step=50)
-    quality = st.number_input("Calidad JPEG", min_value=30, max_value=95, value=60, step=1)
+    max_photos = st.number_input("Máximo de fotos", 1, 30, 5, 1)
+    max_side = st.number_input("Max side (px)", 200, 3000, 800, 50)
+    quality = st.number_input("Calidad JPEG", 30, 95, 60, 1)
 
-    run = st.button("Ejecutar benchmark", type="primary")
+    do_gc = st.checkbox("Forzar gc.collect() entre fases (solo para ver tendencia)", value=False)
+    run = st.button("Ejecutar bench", type="primary")
 
 with col2:
-    st.subheader("Medición")
-    st.caption("RSS = RAM real del proceso. tracemalloc = memoria Python (pico) durante la ejecución.")
+    st.caption("RSS = RAM real del proceso. Se comparan dos pipelines con las mismas fotos.")
+
+
+def maybe_gc():
+    if do_gc:
+        gc.collect()
+
 
 if run:
     if not uploads:
@@ -91,64 +119,109 @@ if run:
 
     sel = uploads[: int(max_photos)]
 
-    rows = []
-    rss_base = rss_mb()
+    # Leer raw bytes
+    raw = [f.getvalue() for f in sel]
+    raw_total = sum(len(b) for b in raw)
 
+    # ==========================================================
+    # PIPELINE A: “como la app” (doble PIL)
+    # 1) PIL para normalizar a jpeg_bytes
+    # 2) PIL otra vez: reabrir esos jpeg_bytes para el HTML
+    # 3) HTML re-encode a jpeg + base64 (tipo html_generator)
+    # ==========================================================
     tracemalloc.start()
+    rss0_a = rss_mb()
     t0 = ms()
-    stage_log(rows, "inicio", t0, rss_base)
+    rows_a = []
+    stage(rows_a, "A: inicio", t0, rss0_a)
 
-    # 1) Leer bytes (simula 'upload' -> bytes)
-    t1 = ms()
-    raw_bytes = []
-    total_raw = 0
-    for f in sel:
-        b = f.getvalue()
-        raw_bytes.append(b)
-        total_raw += len(b)
-    stage_log(rows, "leer bytes (uploads)", t1, rss_base)
+    t = ms()
+    jpeg_bytes_a = [normalize_to_jpeg_bytes(b, int(max_side), int(quality)) for b in raw]
+    stage(rows_a, "A: normalizar (PIL) -> jpeg_bytes", t, rss0_a)
+    maybe_gc()
 
-    # 2) Normalizar a JPEG optimizado
-    t2 = ms()
-    normalized = []
-    total_norm = 0
-    for b in raw_bytes:
-        nb = normalize_to_jpeg_bytes(b, max_side=int(max_side), quality=int(quality))
-        normalized.append(nb)
-        total_norm += len(nb)
-    stage_log(rows, "normalizar JPEG (PIL)", t2, rss_base)
+    t = ms()
+    pil_imgs_a = open_jpegs_as_pil(jpeg_bytes_a)  # segunda pasada por PIL
+    stage(rows_a, "A: reabrir jpeg_bytes como PIL (2ª pasada)", t, rss0_a)
+    maybe_gc()
 
-    # 3) HTML embebiendo base64 (string grande)
-    t3 = ms()
-    html = html_embed_base64(normalized)
-    stage_log(rows, "generar HTML (base64)", t3, rss_base)
+    t = ms()
+    html_a = html_from_pil_images(pil_imgs_a, int(max_side), int(quality))  # re-encode + b64
+    stage(rows_a, "A: generar HTML desde PIL (re-encode+b64)", t, rss0_a)
 
-    current, peak = tracemalloc.get_traced_memory()
+    cur_a, peak_a = tracemalloc.get_traced_memory()
     tracemalloc.stop()
+
+    norm_total_a = sum(len(b) for b in jpeg_bytes_a)
+
+    # Limpieza de refs grandes (para que B no herede tanto)
+    del pil_imgs_a
+    del html_a
+    maybe_gc()
+
+    # ==========================================================
+    # PIPELINE B: optimizado (una sola pasada PIL + HTML sin PIL)
+    # 1) PIL para normalizar a jpeg_bytes
+    # 2) HTML base64 directo (sin PIL)
+    # ==========================================================
+    tracemalloc.start()
+    rss0_b = rss_mb()
+    t0b = ms()
+    rows_b = []
+    stage(rows_b, "B: inicio", t0b, rss0_b)
+
+    t = ms()
+    jpeg_bytes_b = [normalize_to_jpeg_bytes(b, int(max_side), int(quality)) for b in raw]
+    stage(rows_b, "B: normalizar (PIL) -> jpeg_bytes", t, rss0_b)
+    maybe_gc()
+
+    t = ms()
+    html_b = html_from_jpeg_bytes(jpeg_bytes_b)  # sin PIL
+    stage(rows_b, "B: generar HTML desde bytes (sin PIL)", t, rss0_b)
+
+    cur_b, peak_b = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    norm_total_b = sum(len(b) for b in jpeg_bytes_b)
 
     # Resultados
     with col2:
-        st.markdown("### Resultados")
-        st.table(rows)
-
-        st.markdown("### Tamaños")
+        st.markdown("## Pipeline A — como la app (doble PIL)")
+        st.table(rows_a)
         st.write(
             {
                 "fotos": len(sel),
-                "raw_total_mb": round(total_raw / (1024 * 1024), 2),
-                "normalized_total_mb": round(total_norm / (1024 * 1024), 2),
-                "html_len_chars": len(html),
+                "raw_total_mb": round(raw_total / (1024 * 1024), 2),
+                "normalized_total_mb": round(norm_total_a / (1024 * 1024), 2),
+                "tracemalloc_current_mb": round(cur_a / (1024 * 1024), 2),
+                "tracemalloc_peak_mb": round(peak_a / (1024 * 1024), 2),
+                "html_len_chars": "n/a (liberado para no sesgar B)",
             }
         )
 
-        st.markdown("### tracemalloc")
+        st.markdown("## Pipeline B — optimizado (1 PIL + HTML sin PIL)")
+        st.table(rows_b)
         st.write(
             {
-                "current_mb": round(current / (1024 * 1024), 2),
-                "peak_mb": round(peak / (1024 * 1024), 2),
+                "fotos": len(sel),
+                "raw_total_mb": round(raw_total / (1024 * 1024), 2),
+                "normalized_total_mb": round(norm_total_b / (1024 * 1024), 2),
+                "tracemalloc_current_mb": round(cur_b / (1024 * 1024), 2),
+                "tracemalloc_peak_mb": round(peak_b / (1024 * 1024), 2),
+                "html_len_chars": len(html_b),
             }
         )
 
-        st.markdown("### Vista previa (opcional)")
-        with st.expander("Ver HTML embebido (puede ser pesado)"):
-            st.components.v1.html(html, height=400, scrolling=True)
+        st.markdown("## Diferencia clave (picos)")
+        st.write(
+            {
+                "A_rss_base_mb": round(rss0_a, 1),
+                "B_rss_base_mb": round(rss0_b, 1),
+                "nota": "Compara el delta_mb máximo de cada tabla: ahí está el ahorro real.",
+            }
+        )
+
+    with col1:
+        st.markdown("### Vista previa (solo B, opcional)")
+        with st.expander("Ver HTML B (puede pesar)"):
+            st.components.v1.html(html_b, height=400, scrolling=True)
